@@ -1,0 +1,396 @@
+#!/usr/bin/python3 -u
+
+__license__ = "GNU Affero General Public License, version 3.0 or later"
+__contact__ = "https://github.com/makhomed/postgres-backup"
+__version__ = "1.0.0"
+
+try:
+    import tomllib  # https://docs.python.org/3/library/tomllib.html
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib  # https://pypi.org/project/tomli/
+    except ModuleNotFoundError:
+        raise SystemExit(
+            "\nTOML [ https://toml.io/ ] parser not found.\n"
+            "\nInstall it with:\n"
+            "\n    python3 -m pip install tomli\n"
+        )
+
+try:
+    from invoke import run  # https://docs.pyinvoke.org/en/stable/
+except ModuleNotFoundError:
+    raise SystemExit(
+        "\nInvoke [ https://pyinvoke.org/ ] module not found.\n"
+        "\nInstall it with:\n"
+        "\n    python3 -m pip install invoke\n"
+    )
+
+from pathlib import Path
+
+import concurrent.futures
+import datetime
+import grp
+import os
+import pwd
+import shlex
+import signal
+import sys
+import time
+import re
+import warnings
+import shutil
+import numbers
+
+import logging
+import systemd.journal
+
+configuration = None
+configuration_filename = Path("/opt/postgres-backup/postgres-backup.toml")
+configuration_defaults = dict(
+    backup_root="/srv/postgres-backup",
+    backup_save_days = 7,
+    setpriv = "/usr/bin/setpriv",
+    pg_dump = "/usr/bin/pg_dump",
+    pg_dumpall = "/usr/bin/pg_dumpall",
+    pg_restore = "/usr/bin/pg_restore",
+    sha256sum = "/usr/bin/sha256sum",
+    psql = "/usr/bin/psql",
+    zstd = "/usr/bin/zstd",
+    bash = "/usr/bin/bash",
+    user = "postgres",
+    group = "postgres",
+    mode = 0o700,
+    jobs = "auto",
+    compress = "zstd:level=19,long",
+    warning_threshold_hours = 4,
+)
+configuration_overridable = dict(
+    compress = str,
+    warning_threshold_hours = numbers.Real,
+)
+
+user = None
+group = None
+mode = None
+uid = None
+gid = None
+backup_root = None
+backup_save_days = None
+compress = None
+warning_threshold_hours = None
+jobs = None
+setpriv = None
+pg_dump = None
+pg_dumpall = None
+pg_restore = None
+sha256sum = None
+psql = None
+zstd = None
+level = None
+long = None
+bash = None
+
+def read_configuration():
+    global configuration
+    if not configuration_filename.is_file():
+        configuration = configuration_defaults
+    else:
+        configuration = tomllib.loads(configuration_filename.read_text())
+        for key in configuration_defaults:
+            if key not in configuration:
+                configuration[key] = configuration_defaults[key]
+    global gid
+    gid = grp.getgrnam(configuration["group"]).gr_gid
+    global uid
+    uid = pwd.getpwnam(configuration["user"]).pw_uid
+    mode = configuration["mode"]
+    if not (0o000 <= mode <= 0o777):
+        raise ValueError(f"unexpected mode 0o{mode:0}, expected 0o000 <= mode <= 0o777")
+    configuration["backup_root"] = Path(configuration["backup_root"])
+    compress = configuration["compress"]
+    if not compress.startswith("zstd:"):
+        raise NotImplementedError("only zstd compression supported right now")
+    compress = compress.removeprefix("zstd:")
+    global long
+    if compress.endswith(",long"):
+        compress = compress.removesuffix(",long")
+        long = True
+    else:
+        long = False
+    name, value = compress.split("=")
+    if name != "level":
+        raise ValueError(f"unexpected keyword {name}")
+    global level
+    level = int(value)
+    if level < 1 or level > 19:
+        raise ValueError(
+            f"zstd compression level must be ( 1 <= level ) and ( level <= 19 ) unexpected value {level}"
+        )
+    if configuration["jobs"] == "auto":
+        cpu_count = int(len(os.sched_getaffinity(0))) or int(os.cpu_count())
+        jobs = int(cpu_count / 2) or 1
+        configuration["jobs"] = jobs
+    if not isinstance(configuration["jobs"], int):
+        raise ValueError(f"unexpected jobs value {jobs}, it must be integer number or 'auto' string")
+    binary_keys = [ k for k, v in configuration_defaults.items()
+                    if isinstance(v, str) and (v.startswith("/usr/bin/") or v.startswith("/usr/sbin/")) ]
+    for key in binary_keys:
+        binary = configuration[key]
+        if not Path(binary).is_file():
+            raise ValueError(f'required binary file {binary} not found')
+    this_module = sys.modules[__name__]
+    for name, value in configuration.items():
+        if name not in configuration_defaults:
+            continue
+        if not hasattr(this_module, name):
+            raise ValueError(f"global variable {name} not found in module {__name__}")
+        if getattr(this_module, name) is not None:
+            raise RuntimeError(f"unexpected global variable {name} is not None")
+        setattr(this_module, name, value)
+    databases = set(postgres_databases())
+    for key in configuration:
+        if key not in configuration_defaults:
+            if key not in databases:
+                warnings.warn(f"unexpected configuration section [{key}]")
+    for database in databases:
+        if database in configuration:
+            for key in configuration[database]:
+                if key not in configuration_overridable:
+                    raise ValueError(f"unexpected configuration key {key} in [{database}] section")
+                if not isinstance(configuration[database][key], configuration_overridable[key]):
+                    actual_type = type(configuration[database][key])
+                    expected_type = configuration_overridable[key]
+                    raise ValueError(f"unexpected configuration key {key} in [{database}] section type: excpected type {expected_type} actual type {actual_type}")
+
+
+def register_exit_signal_handlers():
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGQUIT):
+        signal.signal(sig, lambda signum, frame: sys.exit(0))
+
+logger = logging.getLogger(__name__)
+
+def configure_logging():
+    """
+        logger = logging.getLogger(__name__)
+        logger.debug(msg)
+        logger.info(msg)
+        logger.warning(msg)
+        logger.error(msg)
+        logger.critical(msg)
+    """
+    root_logger = logging.getLogger("")
+    root_logger.setLevel(logging.INFO)
+
+    console_log_formatter = logging.Formatter('%(message)s')
+    console_log_handler = logging.StreamHandler()
+    console_log_handler.setFormatter(console_log_formatter)
+    console_log_handler.setLevel(logging.WARNING)
+    root_logger.addHandler(console_log_handler)
+
+    journal_log_formatter = logging.Formatter('%(message)s')
+    journal_log_handler = systemd.journal.JournalHandler(SYSLOG_IDENTIFIER="postgres-backup")
+    journal_log_handler.setFormatter(journal_log_formatter)
+    journal_log_handler.setLevel(logging.INFO)
+    root_logger.addHandler(journal_log_handler)
+
+def init():
+    if os.getegid() != 0 or os.geteuid() != 0:
+        raise ValueError("root privileges required")
+    register_exit_signal_handlers()
+    configure_logging()
+    read_configuration()
+
+class Timer:
+    def __init__(self):
+        self._start_ns = None
+        self._accum_ns = 0
+
+    def start(self):
+        if self._start_ns is None:
+            self._start_ns = time.perf_counter_ns()
+        return self
+
+    def stop(self):
+        if self._start_ns is not None:
+            self._accum_ns += time.perf_counter_ns() - self._start_ns
+            self._start_ns = None
+        return self
+
+    def hours(self):
+        ns = self._accum_ns + (time.perf_counter_ns() - self._start_ns if self._start_ns is not None else 0)
+        t = ns // 1_000_000_000
+        h = t / 3600
+        return h
+
+    def hms(self):
+        ns = self._accum_ns + (time.perf_counter_ns() - self._start_ns if self._start_ns is not None else 0)
+        t = ns // 1_000_000_000
+        h = t // 3600
+        m = (t % 3600) // 60
+        s = t % 60
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
+backup_timestamp = None
+backup_directory = None
+backup_final_dir = None
+
+backup_one_database_duration = None
+backup_total_backup_duration = None
+
+def run_as_postgres(command):
+    if  backup_directory is None and backup_final_dir is None:
+        working_directory = Path('/')
+    elif backup_directory.is_dir():
+        working_directory = backup_directory
+    elif backup_final_dir.is_dir():
+        working_directory = backup_final_dir
+    else:
+        raise RuntimeError(
+            f"unexpected internal state: not exists working directory {backup_final_dir} or {backup_directory}"
+        )
+    working_directory = shlex.quote(str(working_directory))
+    command = shlex.quote(f"cd -P -e {working_directory} && export LC_ALL=C && export TZ=UTC && {command}")
+    return run(
+        f"{setpriv} --reuid={user} --regid={group} --init-groups --no-new-privs --reset-env {bash} -o pipefail -c {command}",
+        hide=True,
+    )
+
+def postgres_databases():
+    sql = shlex.quote(
+        "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate AND datname <> 'postgres' ORDER BY datname;"
+    )
+    stdout = run_as_postgres(
+        f"{psql} -X -v ON_ERROR_STOP=1 -At -F $'\\t' -c {sql}"
+    ).stdout
+    return stdout.strip().splitlines()
+
+
+def postgres_backup_globals_and_schema():
+    def create_postgres_backup_for(entity):
+        filename_timestamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%d-%H%M%S"
+        )
+        filename_partial = (
+            backup_directory / f"{filename_timestamp}--{entity}-only.sql.zst.partial"
+        )
+        filename_alldone = (
+            backup_directory / f"{filename_timestamp}--{entity}-only.sql.zst"
+        )
+        zstd_level = f"-{level}"
+        zstd_long = "--long" if long else ""
+        run_as_postgres(
+            f"{pg_dumpall} --{entity}-only | {zstd} {zstd_level} {zstd_long} -o {filename_partial}"
+        )
+        filename_partial.rename(filename_alldone)
+
+    for entity in ("globals", "schema"):
+        create_postgres_backup_for(entity)
+
+def postgres_backup_prepare():
+    global backup_one_database_duration
+    backup_one_database_duration = dict()
+    global backup_total_backup_duration
+    backup_total_backup_duration = Timer().start()
+    global backup_timestamp
+    backup_timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d-%H%M%S")
+    backup_root.mkdir(mode=mode, parents=True, exist_ok=True)
+    os.chown(backup_root, uid, gid)
+    os.chmod(backup_root, mode)
+    global backup_final_dir
+    backup_final_dir = backup_root / f"{backup_timestamp}-postgres-backup"
+    global backup_directory
+    backup_directory = backup_root / f"{backup_timestamp}-postgres-backup.partial"
+    backup_directory.mkdir(mode=mode, parents=True, exist_ok=True)
+    os.chown(backup_directory, uid, gid)
+    os.chmod(backup_directory, mode)
+
+def postgres_backup_one_database(database):
+    timer = Timer().start()
+    filename_timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d-%H%M%S")
+    filename_partial = (
+        backup_directory / f"{filename_timestamp}-{database}.dump.partial"
+    )
+    filename_alldone = backup_directory / f"{filename_timestamp}-{database}.dump"
+    if database in configuration and 'compress' in configuration[database]:
+        compress = configuration[database]['compress']
+    else:
+        compress = configuration['compress']
+    run_as_postgres(
+        f"{pg_dump} --compress={compress} --file={filename_partial} --format=custom --no-password {database}"
+    )
+    filename_partial.rename(filename_alldone)
+    timer.stop()
+    return database, timer
+
+def postgres_backup_rename():
+    backup_directory.rename(backup_final_dir)
+
+def postgres_backup_verify():
+    for path in backup_final_dir.iterdir():
+        if not (path.name.endswith("BLAKE3-CHECKSUMS") or path.name.endswith(".sql.zst") or path.name.endswith(".dump")):
+            print(f"unexpected file {path}")
+        if not path.name.endswith(".dump"):
+            continue
+        run_as_postgres(f"{pg_restore} --list {path}")
+        run_as_postgres(f"{pg_restore} --data-only --file=/dev/null {path}")
+
+def postgres_backup_checksum():
+    run_as_postgres(f"{sha256sum} --binary --tag *.zst *.dump | LC_ALL=C sort > CHECKSUM")
+
+def postgres_backup_finish():
+    global backup_one_database_duration
+    global backup_total_backup_duration
+    total_duration = backup_total_backup_duration.hms()
+    width =  max((len(database) for database in backup_one_database_duration), default=0)
+    logger.info('postgres backup statistics:')
+    for database in sorted(backup_one_database_duration):
+        compress = configuration[database]['compress'] if database in configuration and 'compress' in configuration[database] else configuration['compress']
+        duration = backup_one_database_duration[database]
+        logger.info(f'++ {duration} {database:{width}} compress="{compress}"')
+    line = '=' * width
+    default_compress = configuration['compress']
+    logger.info(f'== {total_duration} {line} compress="{default_compress}"')
+
+def postgres_delete_old_backups():
+    for path in list(backup_root.iterdir()):
+        if not path.is_dir() or not re.fullmatch(r'\d{4}-\d{2}-\d{2}-\d{6}-postgres-backup', path.name):
+            logger.warning(f'unexpected path {path}')
+        else:       
+            now = time.time()
+            mtime = path.stat().st_mtime
+            if now - mtime > 60 * 60 * 24 * backup_save_days:
+                shutil.rmtree(path)
+
+def postgres_backup_main():
+    postgres_backup_prepare()
+    postgres_backup_globals_and_schema()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs, thread_name_prefix='pg_dump-') as executor:
+        futures = [ executor.submit(postgres_backup_one_database, database) for database in sorted(postgres_databases()) ]
+        done, not_done = concurrent.futures.wait(futures, return_when=concurrent.futures.ALL_COMPLETED)
+    for future in done:
+        try:
+            global backup_one_database_duration
+            database, timer = future.result()
+            database_backup_duration = timer.hms()
+            backup_one_database_duration[database] = database_backup_duration
+            if database in configuration and 'warning_threshold_hours' in configuration[database]:
+                warning_threshold_hours = configuration[database]['warning_threshold_hours']
+            else:
+                warning_threshold_hours = configuration['warning_threshold_hours']
+            if timer.hours() > warning_threshold_hours:
+                hms = timer.hms()
+                logger.warning(f'database {database} dump creation time {hms} exceeds warning_threshold_hours hours limit for this database')
+        except Exception as exc:
+            logger.error(f'postgres-backup: {exc.__class__.__name__}: {exc}', exc_info=exc)
+    postgres_backup_rename()
+    postgres_backup_verify()
+    postgres_backup_checksum()
+    postgres_backup_finish()
+    postgres_delete_old_backups()
+
+def main():
+    init()
+    postgres_backup_main()
+
+if __name__ == "__main__":
+    main()
