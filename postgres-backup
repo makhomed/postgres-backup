@@ -47,7 +47,7 @@ import systemd.journal
 configuration = None
 configuration_filename = Path("/opt/postgres-backup/postgres-backup.toml")
 configuration_defaults = dict(
-    backup_root="/srv/postgres-backup",
+    backup_root = "/srv/postgres-backup",
     backup_save_days = 7,
     setpriv = "/usr/bin/setpriv",
     pg_dump = "/usr/bin/pg_dump",
