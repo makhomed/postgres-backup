@@ -2,7 +2,7 @@
 
 __license__ = "GNU Affero General Public License, version 3.0 or later"
 __contact__ = "https://github.com/makhomed/postgres-backup"
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 try:
     import tomllib  # https://docs.python.org/3/library/tomllib.html
@@ -237,7 +237,7 @@ backup_final_dir = None
 backup_one_database_duration = None
 backup_total_backup_duration = None
 
-def run_as_postgres(command):
+def run_as_postgres(command, warn=False):
     if  backup_directory is None and backup_final_dir is None:
         working_directory = Path('/')
     elif backup_directory.is_dir():
@@ -252,8 +252,14 @@ def run_as_postgres(command):
     command = shlex.quote(f"cd -P -e {working_directory} && export LC_ALL=C && export TZ=UTC && {command}")
     return run(
         f"{setpriv} --reuid={user} --regid={group} --init-groups --no-new-privs --reset-env {bash} -o pipefail -c {command}",
-        hide=True,
+        hide=True, warn=warn,
     )
+
+def test_run_as_postgres(command):
+    process = run_as_postgres(command, warn=True)
+    if process.exited != 0:
+        print(process.stdout)
+        print(process.stderr)
 
 def postgres_databases():
     sql = shlex.quote(
@@ -327,17 +333,30 @@ def postgres_backup_rename():
 
 def postgres_backup_verify():
     for path in backup_final_dir.iterdir():
-        if not (path.name.endswith("BLAKE3-CHECKSUMS") or path.name.endswith(".sql.zst") or path.name.endswith(".dump")):
+        if path.name.endswith(".sql.zst"):
+            run(f'{zstd} --test --quiet {path}', warn=True)
+        elif path.name.endswith(".dump"):
+            test_run_as_postgres(f"{pg_restore} --list {path}")
+            test_run_as_postgres(f"{pg_restore} --data-only --file=/dev/null {path}")
+        else:
             print(f"unexpected file {path}")
-        if not path.name.endswith(".dump"):
-            continue
-        run_as_postgres(f"{pg_restore} --list {path}")
-        run_as_postgres(f"{pg_restore} --data-only --file=/dev/null {path}")
 
 def postgres_backup_checksum():
-    run_as_postgres(f"{sha256sum} --binary --tag *.zst *.dump | LC_ALL=C sort > CHECKSUM")
+    zst_files = '*.zst' if bool(list(backup_final_dir.glob('*.zst'))) else ''
+    dump_files = '*.dump' if bool(list(backup_final_dir.glob('*.dump'))) else ''
+    run_as_postgres(f"{sha256sum} --binary --tag {zst_files} {dump_files} | LC_ALL=C sort > CHECKSUM")
 
-def postgres_backup_finish():
+def postgres_backup_delete_old_backups():
+    for path in list(backup_root.iterdir()):
+        if not path.is_dir() or not re.fullmatch(r'\d{4}-\d{2}-\d{2}-\d{6}-postgres-backup', path.name):
+            logger.warning(f'unexpected path {path}')
+        else:
+            now = time.time()
+            mtime = path.stat().st_mtime
+            if now - mtime > 60 * 60 * 24 * backup_save_days:
+                shutil.rmtree(path)
+
+def postgres_backup_write_statistics():
     global backup_one_database_duration
     global backup_total_backup_duration
     total_duration = backup_total_backup_duration.hms()
@@ -350,16 +369,6 @@ def postgres_backup_finish():
     line = '=' * width
     default_compress = configuration['compress']
     logger.info(f'== {total_duration} {line} compress="{default_compress}"')
-
-def postgres_delete_old_backups():
-    for path in list(backup_root.iterdir()):
-        if not path.is_dir() or not re.fullmatch(r'\d{4}-\d{2}-\d{2}-\d{6}-postgres-backup', path.name):
-            logger.warning(f'unexpected path {path}')
-        else:       
-            now = time.time()
-            mtime = path.stat().st_mtime
-            if now - mtime > 60 * 60 * 24 * backup_save_days:
-                shutil.rmtree(path)
 
 def postgres_backup_main():
     postgres_backup_prepare()
@@ -385,8 +394,8 @@ def postgres_backup_main():
     postgres_backup_rename()
     postgres_backup_verify()
     postgres_backup_checksum()
-    postgres_backup_finish()
-    postgres_delete_old_backups()
+    postgres_backup_delete_old_backups()
+    postgres_backup_write_statistics()
 
 def main():
     init()

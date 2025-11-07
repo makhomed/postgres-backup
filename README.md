@@ -1,7 +1,7 @@
 
-# postgres-backup (version 1.0.0)
+# postgres-backup (version 1.0.1)
 
-This tool, postgres-backup, save backups of all databases, located on current PostgreSQL server
+This tool, postgres-backup, save backups of all databases, located on current PostgreSQL server\
 to the `/srv/postgres-backup/YYYY-MM-DD-HHMMS-postgres-backup` directory.
 
 ## Installation
@@ -28,7 +28,8 @@ cd /opt/postgres-backup ; git pull
 
 ```
 # cat /etc/cron.d/postgres-backup
-
+```
+```
 0 0 * * * root /opt/postgres-backup/postgres-backup
 ```
 
